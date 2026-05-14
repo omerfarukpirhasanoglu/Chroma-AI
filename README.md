@@ -2,11 +2,11 @@
 
 Kullanıcıların giyim tarzını belirleyen, kombinin dominant renklerini algılayıp renk uyum skorunu hesaplayan bir görüntü işleme modeli.
 
----
-
 ## Genel Bakış
 
 Chroma, yüklenen kıyafet görselini analiz ederek iki temel çıktı üretir: modelin öğrendiği stil sınıflarından birine atama yapar ve görseldeki renk paletini renk teorisi çerçevesinde yorumlar. Model EfficientNetV2B2 mimarisi üzerine inşa edilmiş olup 2 fazlı transfer learning stratejisiyle eğitilmiştir.
+
+Modeli denemek için tıklayın: [pirhasanoglu.com](https://pirhasanoglu.com)
 
 ---
 
