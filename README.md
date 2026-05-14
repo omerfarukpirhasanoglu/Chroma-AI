@@ -1,6 +1,6 @@
-# Chroma AI
+# Chroma AI (Keras Tabanlı Göörüntü İşleme Modelim)
 
-Kıyafet görsellerinden stil sınıflandırması ve renk analizi yapan, transfer learning tabanlı bir görüntü tanıma sistemi.
+Kullanıcıların giyim tarzını belirleyen, kombinin dominant renklerini algılayıp renk uyum skorunu hesaplayan bir görüntü işleme modeli.
 
 ---
 
@@ -10,7 +10,9 @@ Chroma, yüklenen kıyafet görselini analiz ederek iki temel çıktı üretir: 
 
 ---
 
-## Mimari
+## Inference Mimarisi
+
+![Architecture](ChromaFlowchart.png)
 
 ### Model
 
@@ -42,7 +44,7 @@ RandomFlip → RandomBrightness → RandomContrast → rot90 → RandomCrop
 
 ### Renk Analizi
 
-1. **Arka plan temizleme** — rembg (u2netp modeli) ile kıyafet maskesi oluşturulur
+1. **Arka plan temizleme** — rembg (u2net modeli) ile kıyafet maskesi oluşturulur
 2. **Dominant renkler** — k-means (k=5) ile baskın renkler tespit edilir
 3. **Nötr filtresi** — siyah, beyaz, gri renkler uyum hesabından ayrı tutulur
 4. **Renk teorisi uyumu** — hue açı farkları üzerinden Monokromatik / Analog / Komplementer / Split-Komplementer / Triadik / Karma sınıflandırması yapılır
@@ -94,21 +96,8 @@ docker run -p 7860:7860 chroma-ai
     ├── Chroma.onnx      # Inference modeli
     └── class_names.json # Sınıf isimleri
 ```
-
----
-
-## Performans
-
-| Metrik | Değer |
-|---|---|
-| Validation Accuracy | ~%93.85 |
-| Inference Süresi | ~300ms (CPU) |
-| Model Boyutu | ~20MB (ONNX) |
-
 ---
 
 ## Notlar
 
 - Model `.keras` formatında eğitilip `tf2onnx` ile ONNX'e dönüştürülmüştür. Bu sayede inference için TensorFlow bağımlılığı kaldırılmış, `onnxruntime` ile hafif ve taşınabilir bir deployment sağlanmıştır.
-- rembg, arka plan temizleme için `u2netp` modelini kullanır. İlk çalıştırmada model otomatik indirilir (~45MB).
-- Augmentation yalnızca eğitim sırasında aktiftir; inference'ta devre dışı kalır.
