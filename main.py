@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 ONNX_MODEL_PATH  = "./saved_model/Chroma.onnx"
 CLASS_NAMES_PATH = "./saved_model/class_names.json"
 IMAGE_SIZE       = (224, 224)
+COLOR_ANALYSIS_SIZE = (200, 200)
 MAX_FILE_SIZE_MB    = 5
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -404,26 +405,122 @@ def get_rembg_session():
     global _rembg_session
     if _rembg_session is None:
         from rembg import new_session
-        _rembg_session = new_session("u2net")
+        _rembg_session = new_session("u2net_cloth_seg")
     return _rembg_session
 
 
-def _rembg_mask(image_bytes: bytes) -> tuple[np.ndarray, np.ndarray]:
+def _rembg_mask(image_bytes: bytes, size: tuple[int, int] = COLOR_ANALYSIS_SIZE) -> tuple[np.ndarray, np.ndarray]:
     from rembg import remove
     session = get_rembg_session()
 
     result_bytes = remove(image_bytes, session=session)
     result       = np.frombuffer(result_bytes, dtype=np.uint8)
     result_img   = cv2.imdecode(result, cv2.IMREAD_UNCHANGED)
+    if result_img is None or result_img.ndim != 3 or result_img.shape[2] < 4:
+        raise ValueError("rembg cikti formati beklenen RGBA yapisinda degil.")
 
     img_rgb = cv2.cvtColor(result_img[:, :, :3], cv2.COLOR_BGR2RGB)
     alpha   = result_img[:, :, 3]
 
-    img_rgb = cv2.resize(img_rgb, (200, 200))
-    alpha   = cv2.resize(alpha,   (200, 200))
+    img_rgb = cv2.resize(img_rgb, size, interpolation=cv2.INTER_AREA)
+    alpha   = cv2.resize(alpha,   size, interpolation=cv2.INTER_AREA)
     mask    = (alpha > 30).astype(np.uint8) * 255
 
     return img_rgb, mask
+
+
+def _decode_rgb_image(image_bytes: bytes, size: tuple[int, int]) -> np.ndarray | None:
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return cv2.resize(img_rgb, size, interpolation=cv2.INTER_AREA)
+
+
+def _normalize_lighting_cv2(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if img_rgb.size == 0:
+        return img_rgb
+
+    valid_mask = (mask > 0).astype(np.uint8)
+    if int(valid_mask.sum()) < 100:
+        return img_rgb
+
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    person_l = l_channel[valid_mask > 0]
+    median_l = float(np.median(person_l))
+    low_l = float(np.percentile(person_l, 12))
+    high_l = float(np.percentile(person_l, 88))
+    contrast_span = max(high_l - low_l, 1.0)
+
+    shadow_limit = max(20.0, median_l - 0.45 * contrast_span)
+    shadow_mask = ((l_channel.astype(np.float32) < shadow_limit) & (valid_mask > 0)).astype(np.uint8)
+    shadow_mask = cv2.morphologyEx(shadow_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    shadow_mask = cv2.GaussianBlur(shadow_mask.astype(np.float32), (0, 0), 2.0)
+    shadow_weight = np.clip(shadow_mask, 0.0, 1.0)
+
+    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(l_channel)
+
+    l_float = l_channel.astype(np.float32)
+    l_clahe_float = l_clahe.astype(np.float32)
+    target_l = min(225.0, median_l + 0.20 * contrast_span)
+    gain = np.clip(target_l / np.maximum(l_float, 12.0), 1.0, 1.65)
+    lifted_l = l_float * gain
+
+    normalized_l = (
+        l_float * (1.0 - shadow_weight) +
+        (0.65 * lifted_l + 0.35 * l_clahe_float) * shadow_weight
+    )
+    normalized_l = np.where(valid_mask > 0, normalized_l, l_float)
+    normalized_l = np.clip(normalized_l, 0, 255).astype(np.uint8)
+
+    normalized_lab = cv2.merge([normalized_l, a_channel, b_channel])
+    return cv2.cvtColor(normalized_lab, cv2.COLOR_LAB2RGB)
+
+
+def _extract_normalized_person(
+    image_bytes: bytes,
+    size: tuple[int, int],
+    fallback_full_image: bool = True,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    try:
+        img_rgb, mask = _rembg_mask(image_bytes, size=size)
+    except Exception as e:
+        logger.error(f"[rembg HATA] {type(e).__name__}: {e}")
+        if not fallback_full_image:
+            return None, None
+        img_rgb = _decode_rgb_image(image_bytes, size)
+        if img_rgb is None:
+            return None, None
+        mask = np.ones(size[::-1], dtype=np.uint8) * 255
+
+    normalized_rgb = _normalize_lighting_cv2(img_rgb, mask)
+    return normalized_rgb, mask
+
+
+def _palette_candidate_mask(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    valid_mask = (mask > 0).astype(np.uint8)
+    if int(valid_mask.sum()) < 100:
+        return valid_mask.astype(bool)
+
+    kernel = np.ones((3, 3), np.uint8)
+    inner_mask = cv2.erode(valid_mask, kernel, iterations=1).astype(bool)
+    if int(inner_mask.sum()) < 100:
+        inner_mask = valid_mask.astype(bool)
+
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+
+    unusable_shadow = (v <= 18) | ((v <= 28) & (s <= 45))
+    candidate_mask = inner_mask & ~unusable_shadow
+    if int(candidate_mask.sum()) < 100:
+        candidate_mask = inner_mask
+
+    return candidate_mask
 
 
 def rgb_to_hsv_numpy(pixels_rgb: np.ndarray) -> np.ndarray:
@@ -453,20 +550,15 @@ def analyze_colors(image_bytes: bytes, n_colors: int = 5) -> dict:
     if not image_bytes:
         return {"dominant_colors": [], "genel_istatistikler": {}}
 
-    try:
-        img_rgb, mask = _rembg_mask(image_bytes)
-    except Exception as e:
-        logger.error(f"[rembg HATA] {type(e).__name__}: {e}")
-        arr = np.frombuffer(image_bytes, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return {"dominant_colors": [], "genel_istatistikler": {}}
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img_rgb = cv2.resize(img_rgb, (200, 200))
-        mask    = np.ones((200, 200), dtype=np.uint8) * 255
+    img_rgb, mask = _extract_normalized_person(image_bytes, COLOR_ANALYSIS_SIZE)
+    if img_rgb is None or mask is None:
+        return {"dominant_colors": [], "genel_istatistikler": {}}
 
-    pixels = img_rgb[mask > 0].astype(np.float32)
+    candidate_mask = _palette_candidate_mask(img_rgb, mask)
+    pixels = img_rgb[candidate_mask].astype(np.float32)
     if len(pixels) < 100:
+        pixels = img_rgb[mask > 0].astype(np.float32)
+    if len(pixels) < max(100, n_colors):
         pixels = img_rgb.reshape(-1, 3).astype(np.float32)
 
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, 0.1)
@@ -544,13 +636,21 @@ def run_inference(img_array: np.ndarray) -> np.ndarray:
     return model.run(None, {input_name: img_array})[0]
 
 def prepare_for_model(image_bytes: bytes) -> np.ndarray:
-    image = Image.open(io.BytesIO(image_bytes))
-    if image.mode == "RGBA":
-        image = rgba_to_rgb_white_bg(image_bytes)
-    else:
-        image = image.convert("RGB")
-    image     = image.resize(IMAGE_SIZE)
-    img_array = np.array(image, dtype=np.float32)
+    img_rgb, mask = _extract_normalized_person(image_bytes, IMAGE_SIZE)
+    if img_rgb is None or mask is None:
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.mode == "RGBA":
+            image = rgba_to_rgb_white_bg(image_bytes)
+        else:
+            image = image.convert("RGB")
+        image = image.resize(IMAGE_SIZE)
+        img_array = np.array(image, dtype=np.float32)
+        return np.expand_dims(img_array, axis=0)
+
+    alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
+    white_bg = np.full_like(img_rgb, 255)
+    composited = img_rgb.astype(np.float32) * alpha + white_bg.astype(np.float32) * (1.0 - alpha)
+    img_array = np.clip(composited, 0, 255).astype(np.float32)
     return np.expand_dims(img_array, axis=0)
 
 def run_color_analysis(image_bytes: bytes) -> dict:
